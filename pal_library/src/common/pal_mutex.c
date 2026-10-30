@@ -163,6 +163,37 @@ int32_t pal_mutex_unlock(pal_mutex_t *mutex)
 }
 
 /**
+ * @brief      Acquires the process-wide PAL mutex.
+ *
+ * @details    Delegates to the statically initialized mutex in the selected
+ *             synchronization backend.
+ *
+ * @return     PAL_OK when acquired or a negative PAL error code.
+ *
+ * @note       The global mutex is non-recursive and requires no lifecycle calls.
+ * @warning    Pair a successful call with pal_mutex_global_unlock().
+ */
+int32_t pal_mutex_global_lock(void)
+{
+    return pal_sync_global_mutex_backend_lock();
+}
+
+/**
+ * @brief      Releases the process-wide PAL mutex.
+ *
+ * @details    Delegates release to the selected synchronization backend.
+ *
+ * @return     PAL_OK when released or a negative PAL error code.
+ *
+ * @note       Only the owning thread may release the mutex.
+ * @warning    Unlocking the global mutex without owning it is invalid.
+ */
+int32_t pal_mutex_global_unlock(void)
+{
+    return pal_sync_global_mutex_backend_unlock();
+}
+
+/**
  * @brief      Returns the opaque platform state associated with a mutex.
  *
  * @details    Provides internal platform synchronization code with access to

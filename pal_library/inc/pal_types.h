@@ -23,7 +23,7 @@
 /** Major version of the PAL base library (incompatible API changes). */
 #define PAL_VERSION_MAJOR 0
 /** Minor version of the PAL base library (backward compatible features). */
-#define PAL_VERSION_MINOR 3
+#define PAL_VERSION_MINOR 5
 /** Patch version of the PAL base library (backward compatible fixes). */
 #define PAL_VERSION_PATCH 0
 

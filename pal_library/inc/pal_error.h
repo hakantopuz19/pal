@@ -96,11 +96,11 @@ enum
 #define PAL_FAILED(status) ((status) < 0)
 
 /* Returns the symbolic name of a status code, e.g. "PAL_ERR_TIMEOUT".
- * Never returns NULL. Full documentation: src/common/pal_error.c         */
+ * Never returns NULL. Full documentation: pal_library/src/common/pal_error.c */
 const char *pal_error_to_string(pal_status_t status);
 
 /* Returns true when the value is PAL_OK or a defined PAL_ERR_* code.
- * Full documentation: src/common/pal_error.c                              */
+ * Full documentation: pal_library/src/common/pal_error.c                  */
 bool pal_error_is_defined(pal_status_t status);
 
 #ifdef __cplusplus

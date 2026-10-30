@@ -1,0 +1,4 @@
+/logs.db
+/logs.db-journal
+/logs.db-shm
+/logs.db-wal

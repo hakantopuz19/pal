@@ -15,6 +15,8 @@ int32_t pal_sync_mutex_backend_create(void **state);
 int32_t pal_sync_mutex_backend_destroy(void *state);
 int32_t pal_sync_mutex_backend_lock(void *state);
 int32_t pal_sync_mutex_backend_unlock(void *state);
+int32_t pal_sync_global_mutex_backend_lock(void);
+int32_t pal_sync_global_mutex_backend_unlock(void);
 void *pal_mutex_backend_state(pal_mutex_t *mutex);
 
 int32_t pal_sync_condition_backend_create(void **state);

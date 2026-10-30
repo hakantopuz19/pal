@@ -34,6 +34,8 @@ typedef struct pal_windows_condition
     CONDITION_VARIABLE value;
 } pal_windows_condition_t;
 
+static SRWLOCK g_pal_global_mutex = SRWLOCK_INIT;
+
 #elif defined(__linux__)
 /* Linux backend implementation. */
 #define _POSIX_C_SOURCE 200809L
@@ -46,6 +48,8 @@ typedef struct pal_windows_condition
 #include "pal_error.h"
 #include "pal_mutex.h"
 #include "pal_backend.h"
+
+static pthread_mutex_t g_pal_global_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #else
 #error "PAL backend is implemented for Windows and Linux only."
@@ -309,6 +313,52 @@ int32_t pal_sync_mutex_backend_unlock(void *state)
         return PAL_ERR_NULL_POINTER;
     }
     return (pthread_mutex_unlock((pthread_mutex_t *)state) == 0)
+        ? PAL_OK
+        : PAL_ERR_INVALID_STATE;
+#endif
+}
+
+/**
+ * @brief      Acquires the statically initialized global backend mutex.
+ *
+ * @details    Uses the platform's process-wide mutex primitive so common PAL
+ *             modules can protect static state without owning native handles.
+ *
+ * @return     PAL_OK when acquired or a negative PAL error code.
+ *
+ * @note       The global backend mutex remains valid for process lifetime.
+ * @warning    Recursive acquisition is not supported.
+ */
+int32_t pal_sync_global_mutex_backend_lock(void)
+{
+#if defined(_WIN32)
+    AcquireSRWLockExclusive(&g_pal_global_mutex);
+    return PAL_OK;
+#elif defined(__linux__)
+    return (pthread_mutex_lock(&g_pal_global_mutex) == 0)
+        ? PAL_OK
+        : PAL_ERR_UNKNOWN;
+#endif
+}
+
+/**
+ * @brief      Releases the statically initialized global backend mutex.
+ *
+ * @details    Releases exclusive ownership of the platform's process-wide
+ *             mutex primitive.
+ *
+ * @return     PAL_OK when released or a negative PAL error code.
+ *
+ * @note       POSIX unlock errors are mapped to PAL_ERR_INVALID_STATE.
+ * @warning    Only the owning thread may release the mutex.
+ */
+int32_t pal_sync_global_mutex_backend_unlock(void)
+{
+#if defined(_WIN32)
+    ReleaseSRWLockExclusive(&g_pal_global_mutex);
+    return PAL_OK;
+#elif defined(__linux__)
+    return (pthread_mutex_unlock(&g_pal_global_mutex) == 0)
         ? PAL_OK
         : PAL_ERR_INVALID_STATE;
 #endif

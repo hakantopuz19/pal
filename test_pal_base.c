@@ -16,6 +16,8 @@
 #include <stdio.h>    /* printf                                          */
 #include <string.h>   /* strcmp, strncmp                                 */
 
+#include <sqlite3.h>
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -30,6 +32,7 @@
 #include "pal_queue.h"
 #include "pal_thread.h"
 #include "pal_socket.h"
+#include "pal_connection.h"
 #include "pal_time.h"
 
 /* ------------------------------------------------------------------ */
@@ -362,6 +365,10 @@ static void test_mutex(void)
     TEST_STEP("Null mutex arguments are rejected", {
         CHECK(pal_mutex_create(NULL) == PAL_ERR_NULL_POINTER);
         CHECK(pal_mutex_lock(NULL) == PAL_ERR_NULL_POINTER);
+    });
+    TEST_STEP("Process-wide PAL mutex can be acquired and released", {
+        CHECK(pal_mutex_global_lock() == PAL_OK);
+        CHECK(pal_mutex_global_unlock() == PAL_OK);
     });
 }
 
@@ -763,6 +770,331 @@ static void test_sockets(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* pal_connection tests                                                */
+/* ------------------------------------------------------------------ */
+
+static void test_connection_echo_callback(
+    pal_connection_t *connection,
+    const pal_connection_event_t *event,
+    void *user_data)
+{
+    size_t sent = 0u;
+    int32_t status;
+
+    status = pal_connection_send(
+        connection,
+        event->peer_id,
+        event->data,
+        event->size,
+        &sent,
+        1000u);
+    PAL_UNUSED(status);
+    PAL_UNUSED(sent);
+    PAL_UNUSED(user_data);
+}
+
+static int test_connection_log_contains(
+    const char *direction,
+    const void *payload,
+    size_t payload_size)
+{
+    sqlite3 *database = NULL;
+    sqlite3_stmt *statement = NULL;
+    int result = 0;
+    int sqlite_status;
+
+    sqlite_status = sqlite3_open_v2(
+        "logs.db",
+        &database,
+        SQLITE_OPEN_READONLY,
+        NULL);
+    if (sqlite_status == SQLITE_OK)
+    {
+        sqlite_status = sqlite3_prepare_v2(
+            database,
+            "SELECT COUNT(*) FROM connection_logs "
+            "WHERE direction = ? AND payload = ?",
+            -1,
+            &statement,
+            NULL);
+    }
+    if (sqlite_status == SQLITE_OK)
+    {
+        sqlite_status = sqlite3_bind_text(
+            statement, 1, direction, -1, SQLITE_STATIC);
+    }
+    if (sqlite_status == SQLITE_OK)
+    {
+        sqlite_status = sqlite3_bind_blob64(
+            statement,
+            2,
+            payload,
+            (sqlite3_uint64)payload_size,
+            SQLITE_STATIC);
+    }
+    if (sqlite_status == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW)
+    {
+        result = sqlite3_column_int(statement, 0) > 0;
+    }
+    if (statement != NULL)
+    {
+        (void)sqlite3_finalize(statement);
+    }
+    if (database != NULL)
+    {
+        (void)sqlite3_close(database);
+    }
+    return result;
+}
+
+static void test_connections(void)
+{
+    pal_connection_t *tcp_server = NULL;
+    pal_connection_t *tcp_client_a = NULL;
+    pal_connection_t *tcp_client_b = NULL;
+    pal_connection_t *udp_server = NULL;
+    pal_connection_t *udp_client = NULL;
+    pal_connection_event_t *server_event = NULL;
+    pal_connection_event_t *server_event_b = NULL;
+    pal_connection_event_t *client_event = NULL;
+    pal_connection_event_t *client_event_b = NULL;
+    pal_connection_t *auto_cleanup_server = NULL;
+    pal_socket_address_t local_address;
+    pal_socket_address_t server_address;
+    const char message_a[] = "connection client A";
+    const char message_b[] = "connection client B";
+    const char udp_message[] = "connection UDP";
+    size_t transferred = 0u;
+    uint64_t dropped_events = 0u;
+    int32_t worker_status = PAL_ERR_UNKNOWN;
+
+    memset(&local_address, 0, sizeof(local_address));
+    local_address.family = PAL_SOCKET_FAMILY_IPV4;
+    local_address.address[0] = 127u;
+    local_address.address[3] = 1u;
+
+    TEST_STEP("Start TCP server worker and query its ephemeral loopback port", {
+        CHECK(pal_connection_open_server(
+                  PAL_CONNECTION_TRANSPORT_TCP,
+                  &local_address,
+                  test_connection_echo_callback,
+                  NULL,
+                  &tcp_server) == PAL_OK);
+        CHECK(pal_connection_get_local_address(tcp_server, &server_address) == PAL_OK);
+        CHECK(server_address.port != 0u);
+        CHECK(pal_connection_get_worker_status(tcp_server, &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+    });
+    TEST_STEP("TCP server accepts multiple clients and echoes concurrent streams", {
+        CHECK(pal_connection_open_client(
+                  PAL_CONNECTION_TRANSPORT_TCP,
+                  &server_address,
+                  NULL,
+                  NULL,
+                  &tcp_client_a) == PAL_OK);
+        CHECK(pal_connection_open_client(
+                  PAL_CONNECTION_TRANSPORT_TCP,
+                  &server_address,
+                  NULL,
+                  NULL,
+                  &tcp_client_b) == PAL_OK);
+        CHECK(pal_connection_send(
+                  tcp_client_a,
+                  0u,
+                  message_a,
+                  sizeof(message_a),
+                  &transferred,
+                  1000u) == PAL_OK);
+        CHECK(transferred == sizeof(message_a));
+        CHECK(pal_connection_send(
+                  tcp_client_b,
+                  0u,
+                  message_b,
+                  sizeof(message_b),
+                  &transferred,
+                  1000u) == PAL_OK);
+        CHECK(transferred == sizeof(message_b));
+        CHECK(pal_connection_next_event(
+                  tcp_client_a,
+                  3000u,
+                  &client_event) == PAL_OK);
+        CHECK(client_event != NULL);
+        CHECK(client_event->size == sizeof(message_a));
+        CHECK(memcmp(client_event->data, message_a, sizeof(message_a)) == 0);
+        CHECK(pal_connection_next_event(
+                  tcp_client_b,
+                  3000u,
+                  &client_event_b) == PAL_OK);
+        CHECK(client_event_b != NULL);
+        CHECK(client_event_b->size == sizeof(message_b));
+        CHECK(memcmp(client_event_b->data, message_b, sizeof(message_b)) == 0);
+        CHECK(pal_connection_next_event(
+                  tcp_server,
+                  3000u,
+                  &server_event) == PAL_OK);
+        CHECK(server_event != NULL);
+        CHECK(server_event->peer_id != 0u);
+        CHECK(pal_connection_next_event(
+                  tcp_server,
+                  3000u,
+                  &server_event_b) == PAL_OK);
+        CHECK(server_event_b != NULL);
+        CHECK(server_event_b->peer_id != 0u);
+        CHECK(server_event_b->peer_id != server_event->peer_id);
+        CHECK((server_event->size == sizeof(message_a) &&
+               memcmp(server_event->data, message_a, sizeof(message_a)) == 0 &&
+               server_event_b->size == sizeof(message_b) &&
+               memcmp(server_event_b->data, message_b, sizeof(message_b)) == 0) ||
+              (server_event->size == sizeof(message_b) &&
+               memcmp(server_event->data, message_b, sizeof(message_b)) == 0 &&
+               server_event_b->size == sizeof(message_a) &&
+               memcmp(server_event_b->data, message_a, sizeof(message_a)) == 0));
+        CHECK(pal_connection_get_worker_status(tcp_server, &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+        CHECK(pal_connection_get_worker_status(tcp_client_a, &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+        CHECK(pal_connection_get_worker_status(tcp_client_b, &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+        pal_connection_event_release(client_event);
+        client_event = NULL;
+        pal_connection_event_release(client_event_b);
+        client_event_b = NULL;
+        pal_connection_event_release(server_event);
+        server_event = NULL;
+        pal_connection_event_release(server_event_b);
+        server_event_b = NULL;
+    });
+    TEST_STEP("Close TCP service and both clients after workers finish", {
+        CHECK(pal_connection_close(tcp_client_a) == PAL_OK);
+        CHECK(pal_connection_close(tcp_client_b) == PAL_OK);
+        CHECK(pal_connection_close(tcp_server) == PAL_OK);
+    });
+
+    TEST_STEP("Start UDP server and client receive workers", {
+        CHECK(pal_connection_open_server(
+                  PAL_CONNECTION_TRANSPORT_UDP,
+                  &local_address,
+                  test_connection_echo_callback,
+                  NULL,
+                  &udp_server) == PAL_OK);
+        CHECK(pal_connection_get_local_address(udp_server, &server_address) == PAL_OK);
+        CHECK(server_address.port != 0u);
+        CHECK(pal_connection_open_client(
+                  PAL_CONNECTION_TRANSPORT_UDP,
+                  &server_address,
+                  NULL,
+                  NULL,
+                  &udp_client) == PAL_OK);
+    });
+    TEST_STEP("Idle UDP receive workers wait without reporting errors", {
+        CHECK(pal_connection_next_event(
+                  udp_server,
+                  100u,
+                  &server_event) == PAL_ERR_TIMEOUT);
+        CHECK(server_event == NULL);
+        CHECK(pal_connection_next_event(
+                  udp_client,
+                  100u,
+                  &client_event) == PAL_ERR_TIMEOUT);
+        CHECK(client_event == NULL);
+        CHECK(pal_connection_get_worker_status(
+                  udp_server,
+                  &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+        CHECK(pal_connection_get_worker_status(
+                  udp_client,
+                  &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+    });
+    TEST_STEP("UDP server callback replies and both endpoints enqueue receive events", {
+        CHECK(pal_connection_send(
+                  udp_client,
+                  0u,
+                  udp_message,
+                  sizeof(udp_message),
+                  &transferred,
+                  1000u) == PAL_OK);
+        CHECK(transferred == sizeof(udp_message));
+        CHECK(pal_connection_next_event(
+                  udp_server,
+                  3000u,
+                  &server_event) == PAL_OK);
+        CHECK(server_event != NULL);
+        CHECK(server_event->size == sizeof(udp_message));
+        CHECK(memcmp(server_event->data, udp_message, sizeof(udp_message)) == 0);
+        CHECK(pal_connection_next_event(
+                  udp_client,
+                  3000u,
+                  &client_event) == PAL_OK);
+        CHECK(client_event != NULL);
+        CHECK(client_event->size == sizeof(udp_message));
+        CHECK(memcmp(client_event->data, udp_message, sizeof(udp_message)) == 0);
+        CHECK(pal_connection_get_worker_status(
+                  udp_server,
+                  &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+        CHECK(pal_connection_get_worker_status(
+                  udp_client,
+                  &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+        CHECK(test_connection_log_contains(
+            "out",
+            udp_message,
+            sizeof(udp_message)));
+        CHECK(test_connection_log_contains(
+            "in",
+            udp_message,
+            sizeof(udp_message)));
+        pal_connection_event_release(server_event);
+        server_event = NULL;
+        pal_connection_event_release(client_event);
+        client_event = NULL;
+    });
+    TEST_STEP("Close UDP workers and reject invalid connection arguments", {
+        CHECK(pal_connection_get_dropped_event_count(
+                  udp_server,
+                  &dropped_events) == PAL_OK);
+        CHECK(dropped_events == 0u);
+        CHECK(pal_connection_get_worker_status(
+                  udp_server,
+                  &worker_status) == PAL_OK);
+        CHECK(worker_status == PAL_OK);
+        CHECK(pal_connection_close(udp_client) == PAL_OK);
+        CHECK(pal_connection_close(udp_server) == PAL_OK);
+        CHECK(pal_connection_open_server(
+                  (pal_connection_transport_t)0,
+                  &local_address,
+                  NULL,
+                  NULL,
+                  &udp_server) == PAL_ERR_INVALID_ARGUMENT);
+        CHECK(pal_connection_open_server(
+                  PAL_CONNECTION_TRANSPORT_TCP,
+                  NULL,
+                  NULL,
+                  NULL,
+                  &udp_server) == PAL_ERR_NULL_POINTER);
+        CHECK(pal_connection_open_client(
+                  PAL_CONNECTION_TRANSPORT_TCP,
+                  &local_address,
+                  NULL,
+                  NULL,
+                  NULL) == PAL_ERR_NULL_POINTER);
+        CHECK(pal_connection_close(NULL) == PAL_ERR_NULL_POINTER);
+        pal_connection_event_release(NULL);
+    });
+    TEST_STEP("Normal process exit retains an open worker for automatic cleanup", {
+        CHECK(pal_connection_open_server(
+                  PAL_CONNECTION_TRANSPORT_UDP,
+                  &local_address,
+                  NULL,
+                  NULL,
+                  &auto_cleanup_server) == PAL_OK);
+        CHECK(auto_cleanup_server != NULL);
+    });
+}
+
+/* ------------------------------------------------------------------ */
 /* pal_time tests                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -859,6 +1191,7 @@ int main(void)
     RUN_TEST(test_queue_wakeup);
     RUN_TEST(test_thread);
     RUN_TEST(test_sockets);
+    RUN_TEST(test_connections);
     RUN_TEST(test_time);
 
     printf("%d checks, %d failures\n", g_checks, g_failures);

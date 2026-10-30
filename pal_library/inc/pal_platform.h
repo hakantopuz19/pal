@@ -160,7 +160,7 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Runtime queries (full documentation: src/common/pal_platform.c)      */
+/* Runtime queries (full documentation: pal_library/src/common/pal_platform.c) */
 /* ------------------------------------------------------------------ */
 
 /* Human readable name of the target OS, never NULL. */
